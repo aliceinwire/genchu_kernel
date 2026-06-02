@@ -1,114 +1,189 @@
-#!/bin/bash
+#!/usr/bin/env python3
 
-tmp_conf=$(mktemp "/tmp/config_${kernelversion}.XXXXXXXXXX")
-#tmp_conf="/root/test_config_aaaaaa"
-echo "temporary_config_file: ${tmp_conf}"
+import argparse
+import atexit
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
-usage() {
-  printf "Usage: $0 [-k][options]\n"
-  printf " -k kernel version to install (example 5.14.14)\n"
-  printf "\n"
-  exit 1
-}
 
-remove_old_kernel() {
-  emerge -C gentoo-sources
-  rm -Rf /usr/src/*-gentoo*
-  find /boot/ /lib/modules/ -mindepth 1 -maxdepth 1 -name \*gentoo\* ! -name \*$(uname -r) -exec rm -R {} \;
-}
+def run(cmd: str, *, allow_fail: bool = False) -> int:
+    proc = subprocess.run(cmd, shell=True)
+    if proc.returncode != 0 and not allow_fail:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return proc.returncode
 
-prepare_kernel() {
-  emerge -b =gentoo-sources-$kernelversion --nodeps
-  eselect kernel set linux-$kernelversion-gentoo
-  wget https://raw.githubusercontent.com/damentz/liquorix-package/$kernelmajversion/master/linux-liquorix/debian/config/kernelarch-x86/config-arch-64 -O ${tmp_conf}
-  sed -i "s/CONFIG_CRYPTO_CRC32C=m/CONFIG_CRYPTO_CRC32C=y/; s/CONFIG_FW_LOADER_USER_HELPER=y/CONFIG_FW_LOADER_USER_HELPER=n/; s/CONFIG_I2C_NVIDIA_GPU=/#CONFIG_I2C_NVIDIA_GPU=/; s/CONFIG_R8169=m/CONFIG_R8169=y/" ${tmp_conf}
-  sed -i "s/CONFIG_RT_GROUP_SCHED=y/CONFIG_RT_GROUP_SCHED=n/" ${tmp_conf}
-  sed -i "s/CONFIG_ISO9660_FS=m/CONFIG_ISO9660_FS=y/" ${tmp_conf}
-}
 
-aufs_patches() {
-  cd /usr/src/linux-$kernelversion-gentoo/
-  git clone --single-branch --branch aufs$kernelmajversion git://github.com/sfjro/aufs5-standalone.git
-  patch -p1 <aufs5-standalone/aufs5-kbuild.patch
-  patch -p1 <aufs5-standalone/aufs5-base.patch
-  patch -p1 <aufs5-standalone/aufs5-mmap.patch
-  cp -R aufs5-standalone/{Documentation,fs} .
-  cp aufs5-standalone/include/uapi/linux/aufs_type.h include/uapi/linux/
-  cd -
-}
+def run_command(args: list[str], *, env: dict[str, str] | None = None) -> int:
+    proc = subprocess.run(args, env=env)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args)
+    return proc.returncode
 
-genchu_patches() {
-  cd /usr/src/linux-$kernelversion-gentoo/
-  wget https://raw.githubusercontent.com/aliceinwire/genchu_kernel/refs/heads/master/5000-Add-genchu-logo.patch
-  patch -p1 <5000-Add-genchu-logo.patch
-  cd -
-}
 
-build_kernel() {
-  genkernel --kernel-ld=ld.bfd --microcode=none --kernel-config=${tmp_conf} --luks --lvm all
-  XZ_OPT="--lzma1=preset=9e,dict=128MB,nice=273,depth=200,lc=4" tar --lzma -cf /var/cache/binpkgs/s/kernel.tar.lzma /boot/*$kernelversion-gentoo /lib/modules/$kernelversion-gentoo &
-}
+def usage_error(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(1)
 
-build_gnu_kernel() {
-  cp -R /usr/src/linux-$kernelversion-gentoo/ /usr/src/linux-$kernelversion-gentoo-gnu/
 
-  cd /usr/src/linux-$kernelversion-gentoo-gnu/
-  wget https://linux-libre.fsfla.org/pub/linux-libre/releases/$kernelversion-gnu/deblob-$kernelmajversion https://linux-libre.fsfla.org/pub/linux-libre/releases/$kernelversion-gnu/deblob-check
-  chmod +x deblob-$kernelmajversion deblob-check
-  PYTHON="python2.7" ./deblob-$kernelmajversion
-  cd -
+@dataclass(frozen=True)
+class KernelLayout:
+    package_version: str
+    source_suffix: str
+    source_dir_name: str
+    major_version: str
 
-  genkernel --kernel-ld=ld.bfd --kernel-config=${tmp_conf} --luks --lvm --kerneldir=/usr/src/linux-$kernelversion-gentoo-gnu/ all
-  XZ_OPT="--lzma1=preset=9e,dict=128MB,nice=273,depth=200,lc=4" tar --lzma -cf /var/cache/binpkgs/s/kernel-libre.tar.lzma /boot/*$kernelversion-gentoo-gnu /lib/modules/$kernelversion-gentoo-gnu &
-  rm -Rf /usr/src/linux-$kernelversion-gentoo-gnu/
-}
 
-clean() {
-  rm -v ${tmp_conf}
-}
+def parse_kernel_layout(kernel_version: str) -> KernelLayout:
+    match = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-(r\d+))?", kernel_version)
+    if not match:
+        usage_error('Invalid -k value. Expected forms like "7.0.10" or "7.0.10-r1".')
 
-# Main
-if [ $(id -u) != "0" ]; then
-  echo "This script must be run as root" 1>&2
-  exit 1
-fi
+    base_version = match.group(1)
+    revision = match.group(2)
+    source_suffix = f"{base_version}-gentoo-{revision}" if revision else f"{base_version}-gentoo"
+    return KernelLayout(
+        package_version=kernel_version,
+        source_suffix=source_suffix,
+        source_dir_name=f"linux-{source_suffix}",
+        major_version=base_version.rsplit(".", 1)[0],
+    )
 
-while getopts ":k:h:" opt; do
-  case $opt in
-  k)
-    kernelversion=$OPTARG
-    ;;
-  h)
-    usage
-    ;;
-  \?)
-    echo "Invalid option: -$OPTARG" >&2
-    usage
-    ;;
-  :)
-    echo "Option -$OPTARG requires an argument." >&2
-    usage
-    ;;
-  esac
-done
-if [ $OPTIND -eq 1 ]; then usage; fi
-kernelmajorversion=${kernelversion%.*}
 
-if [ ! -d '/var/cache/binpkgs/s/' ]; then
-  mkdir -p /var/cache/binpkgs/s/
-fi
+def apply_genchu_patch(kernel_src_dir: Path) -> None:
+    repo_patch = Path(__file__).resolve().parent / "5000-Add-genchu-logo.patch"
+    local_patch = kernel_src_dir / "5000-Add-genchu-logo.patch"
 
-#export BINPKG_COMPRESS="xz" XZ_OPT="--x86 --lzma2=preset=9e,dict=128MB,nice=273,depth=200,lc=4"
+    if repo_patch.exists():
+        print(f"Using local Genchu patch: {repo_patch}")
+        local_patch.write_bytes(repo_patch.read_bytes())
+    else:
+        print("Local Genchu patch not found next to script; downloading from GitHub")
+        run(
+            "wget https://raw.githubusercontent.com/aliceinwire/genchu_kernel/refs/heads/master/5000-Add-genchu-logo.patch"
+        )
 
-#remove_old_kernel
-prepare_kernel
-#aufs_patches
-genchu_patches
-build_kernel
-cd /usr/src/linux/
-make clean
-make LD=ld.bfd prepare
-make LD=ld.bfd modules_prepare
-wait
-LD=ld.bfd emerge -b @module-rebuild
-clean
+    rc = run(f"patch -p1 --forward < {local_patch.name}", allow_fail=True)
+    if rc != 0:
+        print(
+            "WARNING: Genchu logo patch did not apply cleanly for this kernel version. "
+            "Continuing build without failing.",
+            file=sys.stderr,
+        )
+
+
+def collect_kernel_artifacts(
+    kernel_src_suffix: str,
+    *,
+    boot_dir: Path = Path("/boot"),
+    modules_root: Path = Path("/lib/modules"),
+) -> tuple[list[Path], list[Path]]:
+    boot_matches = sorted(boot_dir.glob(f"*{kernel_src_suffix}*"))
+    if not boot_matches:
+        print(f"WARNING: No boot artifacts matched '*{kernel_src_suffix}*'.", file=sys.stderr)
+
+    module_candidates = [
+        modules_root / kernel_src_suffix,
+        *sorted(modules_root.glob(f"{kernel_src_suffix}*")),
+    ]
+    module_matches = []
+    seen_modules = set()
+    for module_dir in module_candidates:
+        if module_dir in seen_modules or not module_dir.is_dir():
+            continue
+        seen_modules.add(module_dir)
+        module_matches.append(module_dir)
+
+    if not module_matches:
+        print(
+            f"WARNING: No /lib/modules directory found for '{kernel_src_suffix}'. "
+            "Tried exact and prefix matches.",
+            file=sys.stderr,
+        )
+
+    return boot_matches, module_matches
+
+
+def package_kernel_artifacts(kernel_src_suffix: str) -> None:
+    boot_artifacts, module_dirs = collect_kernel_artifacts(kernel_src_suffix)
+    artifacts = [*boot_artifacts, *module_dirs]
+    if not artifacts:
+        print(
+            "WARNING: Skipping kernel artifact archive because no matching /boot or "
+            f"/lib/modules paths were found for '{kernel_src_suffix}'.",
+            file=sys.stderr,
+        )
+        return
+
+    env = os.environ.copy()
+    env["XZ_OPT"] = "--lzma1=preset=9e,dict=128MB,nice=273,depth=200,lc=4"
+    tar_inputs = [str(path.relative_to("/")) for path in artifacts]
+    run_command(
+        ["tar", "--lzma", "-cf", "/var/cache/binpkgs/s/kernel.tar.lzma", "-C", "/", *tar_inputs],
+        env=env,
+    )
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        usage_error("This script must be run as root")
+
+    parser = argparse.ArgumentParser(prog="kernel-build", description="Build Gentoo kernel with Genchu customizations.")
+    parser.add_argument("-k", "--kernel", required=True, help='Kernel version, e.g. "7.0.10" or "7.0.10-r1"')
+    args = parser.parse_args()
+
+    kernel_layout = parse_kernel_layout(args.kernel)
+
+    tmp_conf = tempfile.NamedTemporaryFile(prefix=f"config_{kernel_layout.package_version}.", delete=False)
+    tmp_conf.close()
+    print(f"temporary_config_file: {tmp_conf.name}")
+
+    def cleanup() -> None:
+        if os.path.exists(tmp_conf.name):
+            os.remove(tmp_conf.name)
+            print(f"removed temporary file: {tmp_conf.name}")
+
+    atexit.register(cleanup)
+    Path("/var/cache/binpkgs/s/").mkdir(parents=True, exist_ok=True)
+
+    run(f"emerge -b =gentoo-sources-{kernel_layout.package_version} --nodeps")
+    run(f"eselect kernel set {shlex.quote(kernel_layout.source_dir_name)}")
+    run(
+        "wget "
+        f"https://raw.githubusercontent.com/damentz/liquorix-package/{kernel_layout.major_version}/master/linux-liquorix/debian/config/kernelarch-x86/config-arch-64 "
+        f"-O {tmp_conf.name}"
+    )
+    run(
+        "sed -i "
+        "\"s/CONFIG_CRYPTO_CRC32C=m/CONFIG_CRYPTO_CRC32C=y/; "
+        "s/CONFIG_FW_LOADER_USER_HELPER=y/CONFIG_FW_LOADER_USER_HELPER=n/; "
+        "s/CONFIG_I2C_NVIDIA_GPU=/#CONFIG_I2C_NVIDIA_GPU=/; "
+        f"s/CONFIG_R8169=m/CONFIG_R8169=y/\" {tmp_conf.name}"
+    )
+    run(f"sed -i \"s/CONFIG_RT_GROUP_SCHED=y/CONFIG_RT_GROUP_SCHED=n/\" {tmp_conf.name}")
+    run(f"sed -i \"s/CONFIG_ISO9660_FS=m/CONFIG_ISO9660_FS=y/\" {tmp_conf.name}")
+
+    kernel_src_dir = Path("/usr/src") / kernel_layout.source_dir_name
+    prev_cwd = Path.cwd()
+    os.chdir(kernel_src_dir)
+    apply_genchu_patch(kernel_src_dir)
+    os.chdir(prev_cwd)
+
+    run(f"genkernel --kernel-ld=ld.bfd --microcode=none --kernel-config={tmp_conf.name} --luks --lvm all")
+    package_kernel_artifacts(kernel_layout.source_suffix)
+
+    os.chdir("/usr/src/linux/")
+    run("make clean")
+    run("make LD=ld.bfd prepare")
+    run("make LD=ld.bfd modules_prepare")
+    run("LD=ld.bfd emerge -b @module-rebuild")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
